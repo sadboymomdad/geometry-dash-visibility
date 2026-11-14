@@ -1,218 +1,147 @@
-#define GL_GLEXT_PROTOTYPES
 #include <Geode/Geode.hpp>
 #include <Geode/modify/CCNode.hpp>
-#include <OpenGL/gl.h>
-#include <OpenGL/glext.h>
+#include <CoreGraphics/CoreGraphics.h>
 #include <algorithm>
-#include <string>
+#include <cmath>
+#include <cstdint>
+#include <vector>
 
 using namespace geode::prelude;
 
 namespace Visibility {
-    GLuint program = 0;
-    GLuint screenTexture = 0;
-    GLint screenWidth = 0;
-    GLint screenHeight = 0;
-    GLint screenUniform = -1;
-    GLint gammaUniform = -1;
-    GLint brightnessUniform = -1;
-    bool samplerConfigured = false;
-    float lastGamma = -1.0f;
-    float lastBrightness = -1.0f;
-    bool failed = false;
+    struct OriginalGamma {
+        CGDirectDisplayID display = kCGNullDirectDisplay;
+        uint32_t count = 0;
+        std::vector<CGGammaValue> red;
+        std::vector<CGGammaValue> green;
+        std::vector<CGGammaValue> blue;
+        bool saved = false;
+    };
 
-    constexpr char const* vertexShader = R"(
-        #version 120
-        varying vec2 vTexCoord;
-        void main() {
-            gl_Position = gl_Vertex;
-            vTexCoord = gl_MultiTexCoord0.st;
+    OriginalGamma original;
+    double lastAmount = -1.0;
+
+    void restore() {
+        if (!original.saved) return;
+
+        CGError result = CGSetDisplayTransferByTable(
+            original.display, original.count,
+            original.red.data(), original.green.data(), original.blue.data()
+        );
+
+        if (result != kCGErrorSuccess) {
+            log::warn("Could not restore original display gamma (CoreGraphics error {}).",
+                      static_cast<int>(result));
         }
-    )";
 
-    constexpr char const* fragmentShader = R"(
-        #version 120
-        uniform sampler2D uScreen;
-        uniform float uGamma;
-        uniform float uBrightness;
-        varying vec2 vTexCoord;
-
-        void main() {
-            vec4 source = texture2D(uScreen, vTexCoord);
-            vec3 lifted = pow(max(source.rgb, vec3(0.0)), vec3(1.0 / uGamma));
-            lifted *= uBrightness;
-            gl_FragColor = vec4(clamp(lifted, 0.0, 1.0), source.a);
-        }
-    )";
-
-    bool compileShader(GLuint shader, char const* source) {
-        glShaderSource(shader, 1, &source, nullptr);
-        glCompileShader(shader);
-
-        GLint success = GL_FALSE;
-        glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
-        if (success == GL_TRUE) return true;
-
-        GLint length = 0;
-        glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &length);
-        std::string message(static_cast<size_t>(length > 1 ? length : 1), '\0');
-        glGetShaderInfoLog(shader, length, nullptr, message.data());
-        log::error("Visibility shader compile failed: {}", message);
-        return false;
+        original = OriginalGamma{};
+        lastAmount = -1.0;
     }
 
-    bool initialize() {
-        if (program) return true;
-        if (failed) return false;
-
-        GLuint vertex = glCreateShader(GL_VERTEX_SHADER);
-        GLuint fragment = glCreateShader(GL_FRAGMENT_SHADER);
-        if (!vertex || !fragment ||
-            !compileShader(vertex, vertexShader) ||
-            !compileShader(fragment, fragmentShader)) {
-            if (vertex) glDeleteShader(vertex);
-            if (fragment) glDeleteShader(fragment);
-            failed = true;
+    bool saveOriginal(CGDirectDisplayID display) {
+        uint32_t capacity = CGDisplayGammaTableCapacity(display);
+        if (capacity == 0 || capacity > 4096) {
+            log::warn("This display does not provide a usable gamma table.");
             return false;
         }
 
-        program = glCreateProgram();
-        glAttachShader(program, vertex);
-        glAttachShader(program, fragment);
-        glLinkProgram(program);
-        glDeleteShader(vertex);
-        glDeleteShader(fragment);
+        OriginalGamma saved;
+        saved.display = display;
+        saved.red.resize(capacity);
+        saved.green.resize(capacity);
+        saved.blue.resize(capacity);
 
-        GLint linked = GL_FALSE;
-        glGetProgramiv(program, GL_LINK_STATUS, &linked);
-        if (linked != GL_TRUE) {
-            GLint length = 0;
-            glGetProgramiv(program, GL_INFO_LOG_LENGTH, &length);
-            std::string message(static_cast<size_t>(length > 1 ? length : 1), '\0');
-            glGetProgramInfoLog(program, length, nullptr, message.data());
-            log::error("Visibility shader link failed: {}", message);
-            glDeleteProgram(program);
-            program = 0;
-            failed = true;
+        CGError result = CGGetDisplayTransferByTable(
+            display, capacity,
+            saved.red.data(), saved.green.data(), saved.blue.data(),
+            &saved.count
+        );
+
+        if (result != kCGErrorSuccess || saved.count == 0 || saved.count > capacity) {
+            log::warn("Could not read the original display gamma (CoreGraphics error {}).",
+                      static_cast<int>(result));
             return false;
         }
 
-        screenUniform = glGetUniformLocation(program, "uScreen");
-        gammaUniform = glGetUniformLocation(program, "uGamma");
-        brightnessUniform = glGetUniformLocation(program, "uBrightness");
-
-        glGenTextures(1, &screenTexture);
-        glBindTexture(GL_TEXTURE_2D, screenTexture);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        log::info("Gameplay Visibility shader initialized.");
+        saved.red.resize(saved.count);
+        saved.green.resize(saved.count);
+        saved.blue.resize(saved.count);
+        saved.saved = true;
+        original = std::move(saved);
         return true;
     }
 
     void apply() {
         const double amount = Mod::get()->getSettingValue<double>("visibility");
-        if (amount <= 0.001 || !initialize()) return;
 
-        GLint viewport[4] = {0, 0, 0, 0};
-        GLint previousProgram = 0;
-        GLint previousActiveTexture = GL_TEXTURE0;
-        glGetIntegerv(GL_VIEWPORT, viewport);
-        glGetIntegerv(GL_CURRENT_PROGRAM, &previousProgram);
-        glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActiveTexture);
-
-        const GLint width = viewport[2];
-        const GLint height = viewport[3];
-        if (width <= 0 || height <= 0) return;
-
-        glActiveTexture(GL_TEXTURE0);
-        GLint previousTexture = 0;
-        glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
-        glBindTexture(GL_TEXTURE_2D, screenTexture);
-
-        if (width != screenWidth || height != screenHeight) {
-            screenWidth = width;
-            screenHeight = height;
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
-                         GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        if (amount <= 0.001) {
+            restore();
+            return;
         }
 
-        // Copy the already-rendered game frame into the texture before drawing
-        // the corrected image back over the same viewport.
-        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
-                            viewport[0], viewport[1], width, height);
+        const CGDirectDisplayID display = CGMainDisplayID();
+        if (original.saved && original.display != display) {
+            restore();
+        }
 
-        const GLboolean blendWasEnabled = glIsEnabled(GL_BLEND);
-        const GLboolean depthWasEnabled = glIsEnabled(GL_DEPTH_TEST);
-        const GLboolean scissorWasEnabled = glIsEnabled(GL_SCISSOR_TEST);
-        const GLboolean stencilWasEnabled = glIsEnabled(GL_STENCIL_TEST);
-        const GLboolean cullWasEnabled = glIsEnabled(GL_CULL_FACE);
-
-        glDisable(GL_BLEND);
-        glDisable(GL_DEPTH_TEST);
-        glDisable(GL_SCISSOR_TEST);
-        glDisable(GL_STENCIL_TEST);
-        glDisable(GL_CULL_FACE);
+        if (!original.saved && !saveOriginal(display)) return;
+        if (std::abs(amount - lastAmount) < 0.0001) return;
 
         const float t = static_cast<float>(std::clamp(amount, 0.0, 1.0));
         const float gamma = 1.0f + 1.25f * t;
         const float brightness = 1.0f + 0.16f * t;
 
-        glUseProgram(program);
-        if (!samplerConfigured) {
-            glUniform1i(screenUniform, 0);
-            samplerConfigured = true;
-        }
-        if (gamma != lastGamma) {
-            glUniform1f(gammaUniform, gamma);
-            lastGamma = gamma;
-        }
-        if (brightness != lastBrightness) {
-            glUniform1f(brightnessUniform, brightness);
-            lastBrightness = brightness;
+        std::vector<CGGammaValue> red(original.count);
+        std::vector<CGGammaValue> green(original.count);
+        std::vector<CGGammaValue> blue(original.count);
+
+        for (uint32_t i = 0; i < original.count; ++i) {
+            const float input = original.count > 1
+                ? static_cast<float>(i) / static_cast<float>(original.count - 1)
+                : 0.0f;
+
+            auto adjust = [&](CGGammaValue value) {
+                const float base = std::clamp(static_cast<float>(value), 0.0f, 1.0f);
+                return static_cast<CGGammaValue>(
+                    std::clamp(std::pow(base, 1.0f / gamma) * brightness, 0.0f, 1.0f)
+                );
+            };
+
+            red[i] = adjust(original.red[i]);
+            green[i] = adjust(original.green[i]);
+            blue[i] = adjust(original.blue[i]);
+            (void)input;
         }
 
-        glBegin(GL_QUADS);
-            glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f, -1.0f);
-            glTexCoord2f(1.0f, 0.0f); glVertex2f( 1.0f, -1.0f);
-            glTexCoord2f(1.0f, 1.0f); glVertex2f( 1.0f,  1.0f);
-            glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f,  1.0f);
-        glEnd();
+        CGError result = CGSetDisplayTransferByTable(
+            original.display, original.count,
+            red.data(), green.data(), blue.data()
+        );
 
-        glUseProgram(static_cast<GLuint>(previousProgram));
-        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
-        glActiveTexture(static_cast<GLenum>(previousActiveTexture));
-
-        if (blendWasEnabled) glEnable(GL_BLEND); else glDisable(GL_BLEND);
-        if (depthWasEnabled) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
-        if (scissorWasEnabled) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
-        if (stencilWasEnabled) glEnable(GL_STENCIL_TEST); else glDisable(GL_STENCIL_TEST);
-        if (cullWasEnabled) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+        if (result == kCGErrorSuccess) {
+            lastAmount = amount;
+            log::info("Applied display gamma adjustment.");
+        } else {
+            log::warn("Could not apply display gamma (CoreGraphics error {}).",
+                      static_cast<int>(result));
+        }
     }
 
-    void cleanup() {
-        if (screenTexture) glDeleteTextures(1, &screenTexture);
-        if (program) glDeleteProgram(program);
-        screenTexture = 0;
-        program = 0;
-        screenWidth = 0;
-        screenHeight = 0;
-        samplerConfigured = false;
-        lastGamma = -1.0f;
-        lastBrightness = -1.0f;
-    }
+    struct RestoreOnUnload {
+        ~RestoreOnUnload() {
+            restore();
+        }
+    };
+
+    RestoreOnUnload restoreOnUnload;
 }
 
 class $modify(VisibilityNode, CCNode) {
     void visit() {
         CCNode::visit();
 
-        // The active root scene is visited after its children. Applying the
-        // post-process here means the full rendered frame is available.
         if (this == static_cast<CCNode*>(CCDirector::sharedDirector()->getRunningScene())) {
             Visibility::apply();
         }
     }
 };
-
