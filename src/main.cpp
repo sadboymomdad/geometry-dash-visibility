@@ -16,6 +16,9 @@ namespace Visibility {
     GLint screenUniform = -1;
     GLint gammaUniform = -1;
     GLint brightnessUniform = -1;
+    bool samplerConfigured = false;
+    float lastGamma = -1.0f;
+    float lastBrightness = -1.0f;
     bool failed = false;
 
     constexpr char const* vertexShader = R"(
@@ -146,7 +149,6 @@ namespace Visibility {
         const GLboolean stencilWasEnabled = glIsEnabled(GL_STENCIL_TEST);
         const GLboolean cullWasEnabled = glIsEnabled(GL_CULL_FACE);
 
-        glViewport(viewport[0], viewport[1], width, height);
         glDisable(GL_BLEND);
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_SCISSOR_TEST);
@@ -158,9 +160,18 @@ namespace Visibility {
         const float brightness = 1.0f + 0.16f * t;
 
         glUseProgram(program);
-        glUniform1i(screenUniform, 0);
-        glUniform1f(gammaUniform, gamma);
-        glUniform1f(brightnessUniform, brightness);
+        if (!samplerConfigured) {
+            glUniform1i(screenUniform, 0);
+            samplerConfigured = true;
+        }
+        if (gamma != lastGamma) {
+            glUniform1f(gammaUniform, gamma);
+            lastGamma = gamma;
+        }
+        if (brightness != lastBrightness) {
+            glUniform1f(brightnessUniform, brightness);
+            lastBrightness = brightness;
+        }
 
         glBegin(GL_QUADS);
             glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f, -1.0f);
@@ -172,7 +183,6 @@ namespace Visibility {
         glUseProgram(static_cast<GLuint>(previousProgram));
         glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
         glActiveTexture(static_cast<GLenum>(previousActiveTexture));
-        glViewport(viewport[0], viewport[1], width, height);
 
         if (blendWasEnabled) glEnable(GL_BLEND); else glDisable(GL_BLEND);
         if (depthWasEnabled) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
@@ -188,6 +198,9 @@ namespace Visibility {
         program = 0;
         screenWidth = 0;
         screenHeight = 0;
+        samplerConfigured = false;
+        lastGamma = -1.0f;
+        lastBrightness = -1.0f;
     }
 }
 
