@@ -17,5 +17,5 @@ setup_geode_mod(${PROJECT_NAME})
 
 if (APPLE)
     find_library(COREGRAPHICS_FRAMEWORK CoreGraphics REQUIRED)
-    target_link_libraries(${PROJECT_NAME} PRIVATE ${COREGRAPHICS_FRAMEWORK})
+    target_link_libraries(${PROJECT_NAME} ${COREGRAPHICS_FRAMEWORK})
 endif()
