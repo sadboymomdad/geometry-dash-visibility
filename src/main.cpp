@@ -3,6 +3,8 @@
 #include <Geode/modify/CCNode.hpp>
 #include <OpenGL/gl.h>
 #include <OpenGL/glext.h>
+#include <algorithm>
+#include <string>
 
 using namespace geode::prelude;
 
