@@ -197,15 +197,9 @@ class $modify(VisibilityNode, CCNode) {
 
         // The active root scene is visited after its children. Applying the
         // post-process here means the full rendered frame is available.
-        if (this == CCScene::get()) {
+        if (this == static_cast<CCNode*>(CCDirector::sharedDirector()->getRunningScene())) {
             Visibility::apply();
         }
     }
 };
 
-$on_mod(Unloaded) {
-    // Geode unloads mods during shutdown. The GL context may already be gone,
-    // so avoid issuing GL deletion calls from this callback.
-    Visibility::program = 0;
-    Visibility::screenTexture = 0;
-}
